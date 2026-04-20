@@ -15,7 +15,7 @@ def extract_text_from_pdf(pdf_file) -> tuple[str, str]:
 
     Returns:
         (filename, cleaned_text) — text is truncated to ~3500 chars.
-        Returns (filename, "") on failure.
+        Returns (filename, "") on failure (image-based PDF, password-protected, etc.)
     """
     filename = pdf_file.name
 
@@ -23,9 +23,12 @@ def extract_text_from_pdf(pdf_file) -> tuple[str, str]:
         with pdfplumber.open(pdf_file) as pdf:
             pages_text = []
             for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    pages_text.append(page_text)
+                try:
+                    page_text = page.extract_text()
+                    if page_text and page_text.strip():
+                        pages_text.append(page_text.strip())
+                except Exception:
+                    continue  # skip corrupted pages gracefully
 
             if not pages_text:
                 return filename, ""

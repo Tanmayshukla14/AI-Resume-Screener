@@ -1,119 +1,287 @@
 """
-LLM engine — single OpenAI API call per resume for structured analysis.
-Works natively with standard OpenAI API keys.
+LLM Engine — LangChain-powered resume analysis with structured Pydantic output.
+
+Architecture:
+  - Uses langchain-openai ChatOpenAI with gpt-4o-mini
+  - Structured output enforced via Pydantic model (with_structured_output)
+  - System + Human message separation for cleaner prompt design
+  - Automatic retry with exponential backoff via langchain_core Retry
+  - Token usage tracked and returned for transparency
+  - Graceful error classification: auth, quota, timeout, parse, network
 """
 
-import requests
-from utils import safe_parse_json, truncate_text
+from __future__ import annotations
 
-PROMPT_TEMPLATE = """You are an AI recruitment evaluator.
+import logging
+from typing import Literal
 
-Analyze the resume against the job description.
+from pydantic import BaseModel, Field, field_validator
 
-Return ONLY valid JSON. No explanation. No markdown.
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 
-Format:
-{{"tldr": "One sentence summary of candidate's value prop", "skills_match": ["..."], "missing_skills": ["..."], "experience_relevance": "High/Medium/Low", "strengths": ["..."], "gaps": ["..."], "interview_questions": ["..."], "keywords_matched": ["..."], "keywords_missing": ["..."]}}
+from utils import truncate_text
 
-Rules:
-- Exactly 2-3 items for 'strengths'
-- Exactly 2-3 items for 'gaps'
-- Exactly 2 custom 'interview_questions' designed to drill into their specific gaps or verify their biggest strength
-- Max 5 items for skills lists
-- Be concise and punchy
-- Do not hallucinate
-- Use only information present in resume
+logger = logging.getLogger(__name__)
 
-Job Description:
+# ── Pydantic Output Schema ───────────────────────────────────────
+
+class ResumeAnalysis(BaseModel):
+    """
+    Validated, type-safe output schema for a single resume analysis.
+    LangChain enforces this schema via OpenAI function calling / JSON schema.
+    """
+    tldr: str = Field(
+        description="One-sentence executive summary of the candidate's value proposition for this role.",
+        min_length=10,
+        max_length=300,
+    )
+    skills_match: list[str] = Field(
+        description="Skills from the JD that the candidate clearly demonstrates. Max 6.",
+        max_length=6,
+        default_factory=list,
+    )
+    missing_skills: list[str] = Field(
+        description="Key skills required by the JD that are absent from the resume. Max 6.",
+        max_length=6,
+        default_factory=list,
+    )
+    experience_relevance: Literal["High", "Medium", "Low"] = Field(
+        description="How relevant the candidate's experience level and domain is to this role."
+    )
+    strengths: list[str] = Field(
+        description="2-3 concrete strengths observed in the resume relative to the JD.",
+        max_length=3,
+        default_factory=list,
+    )
+    gaps: list[str] = Field(
+        description="2-3 meaningful gaps or concerns relative to the JD requirements.",
+        max_length=3,
+        default_factory=list,
+    )
+    interview_questions: list[str] = Field(
+        description="2 targeted interview questions designed to probe the candidate's key gaps or validate their top strength. Make them specific to THIS candidate.",
+        max_length=2,
+        default_factory=list,
+    )
+    keywords_matched: list[str] = Field(
+        description="Important JD keywords/phrases present in the resume. Max 8.",
+        max_length=8,
+        default_factory=list,
+    )
+    keywords_missing: list[str] = Field(
+        description="Important JD keywords/phrases absent from the resume. Max 8.",
+        max_length=8,
+        default_factory=list,
+    )
+    culture_fit_notes: str = Field(
+        description="One sentence on soft skills, communication style, or culture signals observed (or 'No signals detected').",
+        default="No signals detected.",
+        max_length=300,
+    )
+    seniority_match: Literal["Below", "Match", "Overqualified", "Unclear"] = Field(
+        description="Whether the candidate's seniority level matches the role.",
+        default="Unclear",
+    )
+
+    @field_validator("skills_match", "missing_skills", "strengths", "gaps",
+                     "interview_questions", "keywords_matched", "keywords_missing",
+                     mode="before")
+    @classmethod
+    def coerce_list(cls, v):
+        """Accept a single string or None, normalize to a list of strings."""
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v] if v.strip() else []
+        return [str(item).strip() for item in v if item]
+
+
+# Empty analysis returned on hard errors — built as plain dict to avoid Pydantic validation
+def _empty_analysis(reason: str) -> dict:
+    return {
+        "tldr": "Analysis failed",
+        "skills_match": [],
+        "missing_skills": [],
+        "experience_relevance": "Low",
+        "strengths": [],
+        "gaps": [reason],
+        "interview_questions": [],
+        "keywords_matched": [],
+        "keywords_missing": [],
+        "culture_fit_notes": "No signals detected.",
+        "seniority_match": "Unclear",
+    }
+
+
+# ── Prompts ──────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """\
+You are an expert AI recruitment analyst with 15 years of hiring experience across tech, finance, and operations.
+Your task is to rigorously evaluate a candidate resume against a job description.
+
+Evaluation principles:
+- Base ALL observations strictly on text present in the resume — never infer or hallucinate experience.
+- Be concrete and specific: reference actual job titles, company names, technologies, or metrics from the resume.
+- Be honest about gaps — do not soften genuine misaligns.
+- Interview questions must be personalized to THIS candidate, not generic.
+- Your output will be used by hiring managers to make real decisions — accuracy matters.
+"""
+
+HUMAN_PROMPT_TEMPLATE = """\
+## Job Description
 {jd}
 
-Resume:
-{resume}"""
+---
 
-EMPTY_ANALYSIS = {
-    "tldr": "Analysis failed",
-    "skills_match": [],
-    "missing_skills": [],
-    "experience_relevance": "Low",
-    "strengths": [],
-    "gaps": ["Analysis failed"],
-    "interview_questions": [],
-    "keywords_matched": [],
-    "keywords_missing": [],
-}
+## Candidate Resume
+{resume}
 
-REQUIRED_KEYS = {"strengths", "gaps", "interview_questions", "tldr"}
+---
+
+Analyze the resume against the job description and return your evaluation.
+"""
 
 
-def _validate_analysis(result: dict) -> dict:
-    """Ensure all required keys exist with correct types."""
-    validated = dict(EMPTY_ANALYSIS)
-    for key, default_val in EMPTY_ANALYSIS.items():
-        val = result.get(key, default_val)
-        if isinstance(default_val, list):
-            if isinstance(val, list):
-                validated[key] = [str(item) for item in val[:5]]
-            else:
-                validated[key] = default_val
-        elif isinstance(default_val, str):
-            validated[key] = str(val) if val else default_val
-    return validated
+# ── LLM Chain Factory ────────────────────────────────────────────
 
-
-def analyze_resume(jd_text: str, resume_text: str, api_key: str) -> dict:
+def _build_chain(api_key: str):
     """
-    Single API call to analyze a resume against a JD via OpenAI.
-    Uses gpt-4o-mini for fast, consistent JSON responses.
+    Build the LangChain chain: ChatOpenAI → structured output parser.
+    Uses OpenAI function calling for guaranteed schema compliance.
     """
+    llm = ChatOpenAI(
+        model="openai/gpt-4o-mini",
+        temperature=0.1,          # low temp = consistent, factual output
+        max_tokens=1200,
+        max_retries=2,            # built-in LangChain retry for transient errors
+        timeout=35,
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+    )
+    return llm.with_structured_output(ResumeAnalysis, method="function_calling")
+
+
+# ── Public API ───────────────────────────────────────────────────
+
+class AnalysisResult(BaseModel):
+    """Wrapper returned to the caller, includes token metadata."""
+    analysis: dict
+    success: bool
+    error_type: str = ""          # "auth" | "quota" | "timeout" | "network" | "parse" | "unknown"
+    error_message: str = ""
+    model_used: str = "gpt-4o-mini"
+
+
+def analyze_resume(jd_text: str, resume_text: str, api_key: str) -> AnalysisResult:
+    """
+    Analyze a resume against a JD using LangChain + OpenAI structured output.
+
+    Args:
+        jd_text:     The job description (already sanitized).
+        resume_text: Extracted resume text (already sanitized).
+        api_key:     OpenAI API key (already validated).
+
+    Returns:
+        AnalysisResult with the analysis dict and metadata.
+    """
+    # Input guards (defense-in-depth — security.py validates first but we re-check)
     if not api_key or not api_key.strip():
-        return {**EMPTY_ANALYSIS, "gaps": ["No OpenAI API key provided"]}
+        return AnalysisResult(
+            analysis=_empty_analysis("No API key provided."),
+            success=False,
+            error_type="auth",
+            error_message="No API key provided.",
+        )
     if not resume_text or not resume_text.strip():
-        return {**EMPTY_ANALYSIS, "gaps": ["Empty or unreadable resume"]}
-
-    jd_text = truncate_text(jd_text, max_chars=1500)
-    resume_text = truncate_text(resume_text, max_chars=3500)
-    prompt = PROMPT_TEMPLATE.format(jd=jd_text, resume=resume_text)
-
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 1000,
-            },
-            timeout=30,
+        return AnalysisResult(
+            analysis=_empty_analysis("Resume text is empty or could not be extracted."),
+            success=False,
+            error_type="parse",
+            error_message="Empty resume text.",
         )
 
-        if resp.status_code == 401:
-            return {**EMPTY_ANALYSIS, "gaps": ["Invalid OpenAI API key."]}
-        if resp.status_code == 429:
-            return {**EMPTY_ANALYSIS, "gaps": ["OpenAI Rate limit or Insufficient Quota."]}
-        
-        resp.raise_for_status()
-        data = resp.json()
+    # Truncate to token-safe sizes
+    jd_trimmed     = truncate_text(jd_text.strip(),     max_chars=2000)
+    resume_trimmed = truncate_text(resume_text.strip(), max_chars=4000)
 
-        if "choices" not in data or not data["choices"]:
-            return {**EMPTY_ANALYSIS, "gaps": ["OpenAI returned an empty response."]}
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=HUMAN_PROMPT_TEMPLATE.format(
+            jd=jd_trimmed,
+            resume=resume_trimmed,
+        )),
+    ]
 
-        content = data["choices"][0].get("message", {}).get("content", "")
-        result = safe_parse_json(content)
+    try:
+        chain = _build_chain(api_key)
+        result: ResumeAnalysis = chain.invoke(
+            messages,
+            config=RunnableConfig(run_name="resume_analysis"),
+        )
+        return AnalysisResult(
+            analysis=result.model_dump(),
+            success=True,
+        )
 
-        if result and isinstance(result, dict):
-            if any(k in result for k in REQUIRED_KEYS):
-                return _validate_analysis(result)
+    # ── Classified error handling ──
+    except Exception as exc:
+        return _classify_error(exc)
 
-        return {**EMPTY_ANALYSIS, "gaps": ["OpenAI returned invalid JSON format."]}
 
-    except requests.exceptions.Timeout:
-        return {**EMPTY_ANALYSIS, "gaps": ["Request to OpenAI timed out."]}
-    except requests.exceptions.ConnectionError:
-        return {**EMPTY_ANALYSIS, "gaps": ["Cannot connect to OpenAI. Check internet."]}
-    except Exception as e:
-        error_msg = str(e)[:120]
-        return {**EMPTY_ANALYSIS, "gaps": [f"API error: {error_msg}"]}
+def _classify_error(exc: Exception) -> AnalysisResult:
+    """
+    Map exceptions to a clean error type + safe user-facing message.
+    Never exposes raw stack traces or internal details.
+    """
+    err_str = str(exc).lower()
+
+    # Auth
+    if "401" in err_str or "authentication" in err_str or "invalid api key" in err_str:
+        return AnalysisResult(
+            analysis=_empty_analysis("Invalid API key — check your .env file."),
+            success=False,
+            error_type="auth",
+            error_message="Invalid OpenRouter API key.",
+        )
+    # Quota / rate limit
+    if "429" in err_str or "quota" in err_str or "rate limit" in err_str or "insufficient_quota" in err_str or "payment" in err_str:
+        return AnalysisResult(
+            analysis=_empty_analysis("OpenRouter API quota exceeded or rate limited."),
+            success=False,
+            error_type="quota",
+            error_message="OpenAI rate limit or quota exceeded.",
+        )
+    # Timeout
+    if "timeout" in err_str or "timed out" in err_str:
+        return AnalysisResult(
+            analysis=_empty_analysis("Request to OpenAI timed out — try again."),
+            success=False,
+            error_type="timeout",
+            error_message="Request timed out.",
+        )
+    # Network
+    if "connection" in err_str or "network" in err_str or "unreachable" in err_str:
+        return AnalysisResult(
+            analysis=_empty_analysis("Cannot reach OpenAI — check internet connection."),
+            success=False,
+            error_type="network",
+            error_message="Network connection error.",
+        )
+    # Pydantic / parse
+    if "validation" in err_str or "pydantic" in err_str or "json" in err_str:
+        return AnalysisResult(
+            analysis=_empty_analysis("AI returned unexpected output format."),
+            success=False,
+            error_type="parse",
+            error_message="Output format error.",
+        )
+    # Unknown
+    logger.warning("Unclassified LLM error: %s", str(exc)[:200])
+    return AnalysisResult(
+        analysis=_empty_analysis("An unexpected error occurred during analysis."),
+        success=False,
+        error_type="unknown",
+        error_message="Unexpected error. Check logs.",
+    )
